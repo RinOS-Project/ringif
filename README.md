@@ -42,3 +42,19 @@ or decoding; discard both output buffers on any non-`RGIF_OK` result. This is
 a header-defined C source interface without a separately versioned binary
 ABI guarantee. RinOS integrates it through RinImage; this repository has no
 standalone build or test target.
+
+## Public API contract
+
+| Requirement | Contract |
+| --- | --- |
+| Purpose | Header-only GIF87a/GIF89a parser and bounded first-frame decoder. |
+| Supported API | Include ringif.h: rgif_get_info, rgif_decode, and rgif_decode_with_scratch. |
+| Unsupported API | Later frames, animation timing, disposal compositing, and playback are unsupported. |
+| ownership | Input, output pixels, index buffer, and optional decoder state are caller-owned; discard output on any error. |
+| thread-safety | Independent calls with independent buffers are reentrant; do not share mutable scratch. |
+| limits | Input 64 MiB, dimension 8192, canvas 16,777,216 pixels, probed frames 1024. |
+| errors | RGIF_OK, RGIF_UNSUPPORTED, RGIF_DATA_ERROR, and RGIF_ERROR distinguish success and failure classes. |
+| ABI stability | Header-defined C source interface; no separately versioned binary ABI. |
+| security | Treat bytes as untrusted; check allocation sizes. No cancellation or CPU deadline. |
+| build | Header-only; add the repository root to the include path. RinOS uses it through RinImage. |
+| test | No standalone test target. Parent sanitizer CI covers the common RinImage GIF path; no tests/builds were run for this README update. |
