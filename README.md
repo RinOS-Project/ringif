@@ -9,10 +9,13 @@ playback.
 Include `ringif.h`. `rgif_get_info` validates the GIF87a/GIF89a structure and
 reports the logical screen size and frame count. `rgif_decode` and
 `rgif_decode_with_scratch` decode only the first image descriptor using GIF
-LZW. The first frame may use a local or global color table, interlacing, and a
-Graphic Control Extension transparency index. The result is numeric
-`0xAARRGGBB` pixels; transparent indices leave the opaque logical-screen
-background in place.
+LZW. `rgif_get_info_cancellable` and `rgif_decode_cancellable` add an optional
+caller-owned cancellation predicate. The structure parser, LZW loop, palette
+validation, and output conversion poll at bounded block/row intervals and
+return `RGIF_CANCELLED` when requested. The first frame may use a local or
+global color table, interlacing, and a Graphic Control Extension transparency
+index. The result is numeric `0xAARRGGBB` pixels; transparent indices leave
+the opaque logical-screen background in place.
 
 Later frames, animation timing, disposal compositing, and animation playback
 are not exposed. An extension block that the first-frame decoder does not
@@ -30,9 +33,10 @@ reentrant when their buffers are independent.
 
 The decoder caps input at 64 MiB, either logical-screen dimension at 8192,
 total canvas pixels at 16,777,216, and probed frame count at 1024. `RGIF_OK`,
-`RGIF_UNSUPPORTED`, `RGIF_DATA_ERROR`, and `RGIF_ERROR` report success,
-unsupported dimensions/profile, malformed data, and invalid/capacity failure.
-There is no cancellation or CPU deadline.
+`RGIF_UNSUPPORTED`, `RGIF_DATA_ERROR`, `RGIF_ERROR`, and `RGIF_CANCELLED` report
+success, unsupported dimensions/profile, malformed data, invalid/capacity
+failure, and caller cancellation. The synchronous predicate runs on the
+calling thread and should be bounded and side-effect safe.
 
 ## Security, ABI, build, and tests
 
@@ -48,13 +52,13 @@ standalone build or test target.
 | Requirement | Contract |
 | --- | --- |
 | Purpose | Header-only GIF87a/GIF89a parser and bounded first-frame decoder. |
-| Supported API | Include ringif.h: rgif_get_info, rgif_decode, and rgif_decode_with_scratch. |
+| Supported API | Include ringif.h: rgif_get_info, rgif_decode, rgif_decode_with_scratch, and their cancellable info/decode variants. |
 | Unsupported API | Later frames, animation timing, disposal compositing, and playback are unsupported. |
 | ownership | Input, output pixels, index buffer, and optional decoder state are caller-owned; discard output on any error. |
 | thread-safety | Independent calls with independent buffers are reentrant; do not share mutable scratch. |
 | limits | Input 64 MiB, dimension 8192, canvas 16,777,216 pixels, probed frames 1024. |
-| errors | RGIF_OK, RGIF_UNSUPPORTED, RGIF_DATA_ERROR, and RGIF_ERROR distinguish success and failure classes. |
+| errors | RGIF_OK, RGIF_UNSUPPORTED, RGIF_DATA_ERROR, RGIF_ERROR, and RGIF_CANCELLED distinguish success and failure classes. |
 | ABI stability | Header-defined C source interface; no separately versioned binary ABI. |
-| security | Treat bytes as untrusted; check allocation sizes. No cancellation or CPU deadline. |
+| security | Treat bytes as untrusted; check allocation sizes and discard output on every non-OK result. The cancellable API bounds parser and decode work at sub-block and row intervals. |
 | build | Header-only; add the repository root to the include path. RinOS uses it through RinImage. |
 | test | No standalone test target. Parent sanitizer CI covers the common RinImage GIF path; no tests/builds were run for this README update. |

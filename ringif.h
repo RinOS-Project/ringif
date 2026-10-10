@@ -18,6 +18,7 @@
 #define RGIF_ERROR         -1
 #define RGIF_DATA_ERROR    -2
 #define RGIF_UNSUPPORTED   -3
+#define RGIF_CANCELLED     -4
 
 #define RGIF_MAX_CODES     4096
 #define RGIF_MAX_STACK     4096
@@ -54,6 +55,8 @@ typedef struct {
     uint8_t r, g, b;
 } RGifColor;
 
+typedef int (*RGifCancellationFunction)(void* context);
+
 typedef struct {
     const uint8_t* data;
     size_t size;
@@ -76,7 +79,14 @@ typedef struct {
     int transparent_index;
     int disposal_method;
     int delay_time;
+    RGifCancellationFunction cancellation;
+    void* cancellation_context;
 } RGifDecoder;
+
+static inline int rgif_cancelled(const RGifDecoder* decoder) {
+    return decoder != NULL && decoder->cancellation != NULL &&
+           decoder->cancellation(decoder->cancellation_context) != 0;
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * ユーティリティ
@@ -149,6 +159,7 @@ static inline int rgif_bs_get_bits(RGifBitStream* bs, int n) {
 
 static inline int rgif_lzw_decode(RGifDecoder* d, size_t data_start, 
                                    uint8_t* output, int output_size) {
+    size_t iterations = 0u;
     if (!d || !output || output_size <= 0 || data_start >= d->size) return -1;
     int min_code_size = d->data[data_start];
     if (min_code_size < 2 || min_code_size > 8) return -1;
@@ -184,6 +195,8 @@ static inline int rgif_lzw_decode(RGifDecoder* d, size_t data_start,
     int saw_end_code = 0;
     
     while (!saw_end_code) {
+        if ((iterations++ & 1023u) == 0u && rgif_cancelled(d))
+            return RGIF_CANCELLED;
         int code = rgif_bs_get_bits(&bs, code_size);
         if (code < 0) break;
         
@@ -269,8 +282,10 @@ static inline int rgif_lzw_decode(RGifDecoder* d, size_t data_start,
 /*
  * GIF画像情報取得
  */
-static inline int rgif_get_info(const uint8_t* data, size_t size,
-                                 int* width, int* height, int* frame_count) {
+static inline int rgif_get_info_cancellable(
+    const uint8_t* data, size_t size, int* width, int* height,
+    int* frame_count, RGifCancellationFunction cancellation,
+    void* cancellation_context) {
     size_t pos;
     int logical_width;
     int logical_height;
@@ -278,6 +293,13 @@ static inline int rgif_get_info(const uint8_t* data, size_t size,
     int frames = 0;
     int saw_trailer = 0;
     uint8_t packed;
+#ifdef __cplusplus
+    RGifDecoder cancel_state = {};
+#else
+    RGifDecoder cancel_state = {0};
+#endif
+    cancel_state.cancellation = cancellation;
+    cancel_state.cancellation_context = cancellation_context;
     if (!data || size < 13u || size > RGIF_MAX_INPUT_BYTES || !width ||
         !height)
         return RGIF_ERROR;
@@ -304,6 +326,7 @@ static inline int rgif_get_info(const uint8_t* data, size_t size,
         if (data[11] >= (uint8_t)gct_size) return RGIF_DATA_ERROR;
     }
     while (pos < size) {
+        if (rgif_cancelled(&cancel_state)) return RGIF_CANCELLED;
         uint8_t block = data[pos++];
         if (block == 0x2cu) {
             uint16_t left;
@@ -340,6 +363,7 @@ static inline int rgif_get_info(const uint8_t* data, size_t size,
                 return RGIF_DATA_ERROR;
             for (;;) {
                 size_t block_size;
+                if (rgif_cancelled(&cancel_state)) return RGIF_CANCELLED;
                 if (pos >= size) return RGIF_DATA_ERROR;
                 block_size = data[pos++];
                 if (block_size == 0u) break;
@@ -352,6 +376,7 @@ static inline int rgif_get_info(const uint8_t* data, size_t size,
             ++pos; /* extension label */
             for (;;) {
                 size_t block_size;
+                if (rgif_cancelled(&cancel_state)) return RGIF_CANCELLED;
                 if (pos >= size) return RGIF_DATA_ERROR;
                 block_size = data[pos++];
                 if (block_size == 0u) break;
@@ -373,26 +398,40 @@ static inline int rgif_get_info(const uint8_t* data, size_t size,
     return RGIF_OK;
 }
 
+static inline int rgif_get_info(const uint8_t* data, size_t size,
+                                 int* width, int* height, int* frame_count) {
+    return rgif_get_info_cancellable(data, size, width, height, frame_count,
+                                     NULL, NULL);
+}
+
 /*
  * GIFデコード（最初のフレームのみ）
  */
-static inline int rgif_decode_with_scratch(
+static inline int rgif_decode_cancellable_with_scratch(
     const uint8_t* data, size_t size,
     uint32_t* pixels, int max_width, int max_height,
     uint8_t* index_buf, size_t index_capacity,
-    RGifDecoder* decoder) {
+    RGifDecoder* decoder, RGifCancellationFunction cancellation,
+    void* cancellation_context) {
     uint8_t* decoder_bytes;
     size_t decoder_index;
     int info_width = 0;
     int info_height = 0;
     if (!data || size < 13u || size > RGIF_MAX_INPUT_BYTES || !pixels ||
-        !index_buf || !decoder ||
-        rgif_get_info(data, size, &info_width, &info_height, NULL) != RGIF_OK)
+        !index_buf || !decoder)
         return RGIF_ERROR;
     decoder_bytes = (uint8_t*)decoder;
     for (decoder_index = 0u; decoder_index < sizeof(*decoder);
          ++decoder_index)
         decoder_bytes[decoder_index] = 0u;
+    decoder->cancellation = cancellation;
+    decoder->cancellation_context = cancellation_context;
+    {
+        const int info_result = rgif_get_info_cancellable(
+            data, size, &info_width, &info_height, NULL, cancellation,
+            cancellation_context);
+        if (info_result != RGIF_OK) return info_result;
+    }
 
 /* Keep the original, audited state accesses while moving their storage to
  * caller-owned scratch. The macro is confined to this function body. */
@@ -433,6 +472,7 @@ static inline int rgif_decode_with_scratch(
     
     /* ブロック解析 */
     while (d.pos < d.size) {
+        if (rgif_cancelled(&d)) return RGIF_CANCELLED;
         uint8_t block = rgif_read8(&d);
         
         if (block == 0x2C) {
@@ -479,21 +519,29 @@ static inline int rgif_decode_with_scratch(
             }
             int max_decode = (int)pixel_count;
             int decoded = rgif_lzw_decode(&d, d.pos, index_buf, max_decode);
+            if (decoded == RGIF_CANCELLED) return RGIF_CANCELLED;
             if (decoded != max_decode) return RGIF_DATA_ERROR;
 
             /* Validate every palette index before touching the caller's
              * pixels.  A malformed frame must not leave a half-rendered
              * bitmap behind on the failure path. */
             for (int i = 0; i < decoded; ++i) {
+                if ((i & 4095) == 0 && rgif_cancelled(&d))
+                    return RGIF_CANCELLED;
                 int idx = index_buf[i];
                 if (idx != d.transparent_index &&
                     (idx < 0 || idx >= color_table_size))
                     return RGIF_DATA_ERROR;
             }
 
-            for (int i = 0; i < d.width * d.height; i++) {
-                pixels[i] = (0xFFu << 24) | ((uint32_t)background.r << 16) |
-                            ((uint32_t)background.g << 8) | background.b;
+            for (int row = 0; row < d.height; ++row) {
+                if (rgif_cancelled(&d)) return RGIF_CANCELLED;
+                const size_t row_start = (size_t)row * (size_t)d.width;
+                for (int column = 0; column < d.width; ++column) {
+                    pixels[row_start + (size_t)column] =
+                        (0xFFu << 24) | ((uint32_t)background.r << 16) |
+                        ((uint32_t)background.g << 8) | background.b;
+                }
             }
 
             if (decoded > 0) {
@@ -507,6 +555,8 @@ static inline int rgif_decode_with_scratch(
                 if (interlace) y = interlace_start[0];
                 
                 for (int i = 0; i < decoded; ) {
+                    if (i % img.width == 0 && rgif_cancelled(&d))
+                        return RGIF_CANCELLED;
                     int x = i % img.width;
                     
                     if (x == 0 && i > 0) {
@@ -568,6 +618,7 @@ static inline int rgif_decode_with_scratch(
                 /* その他のエクステンションをスキップ */
                 int terminated = 0;
                 while (d.pos < d.size) {
+                    if (rgif_cancelled(&d)) return RGIF_CANCELLED;
                     int block_size = rgif_read8(&d);
                     if (block_size == 0) {
                         terminated = 1;
@@ -588,6 +639,29 @@ static inline int rgif_decode_with_scratch(
     return RGIF_OK;
 }
 #undef d
+
+static inline int rgif_decode_with_scratch(
+    const uint8_t* data, size_t size, uint32_t* pixels, int max_width,
+    int max_height, uint8_t* index_buf, size_t index_capacity,
+    RGifDecoder* decoder) {
+    return rgif_decode_cancellable_with_scratch(
+        data, size, pixels, max_width, max_height, index_buf, index_capacity,
+        decoder, NULL, NULL);
+}
+
+static inline int rgif_decode_cancellable(
+    const uint8_t* data, size_t size, uint32_t* pixels, int max_width,
+    int max_height, uint8_t* index_buf, size_t index_capacity,
+    RGifCancellationFunction cancellation, void* cancellation_context) {
+#ifdef __cplusplus
+    RGifDecoder decoder = {};
+#else
+    RGifDecoder decoder = {0};
+#endif
+    return rgif_decode_cancellable_with_scratch(
+        data, size, pixels, max_width, max_height, index_buf, index_capacity,
+        &decoder, cancellation, cancellation_context);
+}
 
 static inline int rgif_decode(const uint8_t* data, size_t size,
                                uint32_t* pixels, int max_width, int max_height,
